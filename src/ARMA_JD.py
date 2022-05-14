@@ -174,7 +174,6 @@ class ARMA_JD(Base):
                 self.H_noise_NnKT = self.xp.ones([self.n_noise, 1, self.n_time]).astype(self.TYPE_FLOAT)
         self.lambda_NFT = self.xp.zeros([self.n_src, self.n_freq, self.n_time], dtype=self.TYPE_FLOAT)
 
-        self.calculate_PSD()
         self.P_FxMxMLt = self.xp.zeros(
             [self.n_freq, self.n_mic, self.n_mic * (self.n_tap_AR + 1)], dtype=self.TYPE_COMPLEX
         )
@@ -185,12 +184,12 @@ class ARMA_JD(Base):
         self.Q_FMM = self.xp.tile(self.xp.eye(self.n_mic), [self.n_freq, 1, 1]).astype(self.TYPE_COMPLEX)
         self.P_FxMxMLt[:, :, : self.n_mic] = self.Q_FMM
         self.G_NLdM = self.xp.maximum(
-            self.g_eps, self.xp.zeros([self.n_speech, self.n_tap_MA + 1, self.n_mic], dtype=self.TYPE_FLOAT)
+            self.g_eps, self.xp.zeros([self.n_src, self.n_tap_MA + 1, self.n_mic], dtype=self.TYPE_FLOAT)
         )
 
         if "circular" in self.init_SCM:
             for m in range(self.n_mic):
-                self.G_NLdM[m % self.n_speech, 0, m] = 1
+                self.G_NLdM[m % self.n_src, 0, m] = 1
 
         elif "twostep" in self.init_SCM:
             self.start_idx = 50
@@ -214,14 +213,12 @@ class ARMA_JD(Base):
             self.P_FxMxMLt = separater_init.P_FxMxMLt
             self.Q_FMM = self.P_FxMxMLt[:, :, : self.n_mic]
 
-            self.G_NLdM = self.g_eps * self.xp.ones(
-                [self.n_speech, self.n_tap_MA + 1, self.n_mic], dtype=self.TYPE_FLOAT
-            )
+            self.G_NLdM = self.g_eps * self.xp.ones([self.n_src, self.n_tap_MA + 1, self.n_mic], dtype=self.TYPE_FLOAT)
             self.G_NLdM[:, 0] = separater_init.G_NLdM[:, 0]
 
             if self.speech_model == "DNN":
                 power_speech_NsxFxT = self.xp.asarray(
-                    self.xp.abs(separater_init.separated_spec[: self.n_speech]) ** 2
+                    np.abs(separater_init.separated_spec[: self.n_speech]) ** 2
                 ).astype(self.xp.float32)
                 power_speech_NsxFxT /= power_speech_NsxFxT.sum(axis=1).mean(axis=1)[:, None, None]
                 with torch.set_grad_enabled(False):
@@ -598,6 +595,8 @@ if __name__ == "__main__":
     parser.add_argument("--n_fft", type=int, default=1024, help="number of frequencies")
     parser.add_argument("--n_speech", type=int, default=3, help="number of speech")
     parser.add_argument("--n_noise", type=int, default=0, help="number of noise")
+    parser.add_argument("--speech_model", type=str, default="NMF", help="NMF, FreqInv, DNN")
+    parser.add_argument("--noise_model", type=str, default="TimeInv", help="TimeInv, NMF")
     parser.add_argument("--n_basis", type=int, default=16, help="number of basis")
     parser.add_argument("--n_tap_MA", type=int, default=8, help="filter length for MA model")
     parser.add_argument("--n_tap_AR", type=int, default=4, help="filter length for AR model")
@@ -615,20 +614,35 @@ if __name__ == "__main__":
 
         print("Use GPU " + str(args.gpu))
         xp.cuda.Device(args.gpu).use()
+        device = torch.device(f"cuda:{args.gpu}" if args.gpu >= 0 else "cpu")
 
     wav, sample_rate = sf.read(args.input_fname)
     wav /= np.abs(wav).max() * 1.2
     M = min(len(wav), args.n_mic)
     spec_FTM = MultiSTFT(wav[:, :M], n_fft=args.n_fft)
 
+    if args.speech_model == "DNN":
+        from VAE_conv1d import VAE
+
+        speech_VAE = VAE(n_freq=args.n_fft // 2 + 1, use_dropout=True, p_dropbout=0.2)
+        nn_fname = f"/n/work3/sekiguch/data_for_paper/Journal2020_2/nn/{speech_VAE.network_name}-{speech_VAE.filename_suffix}-vad=False.pth"
+        state_dict = torch.load(nn_fname)
+        speech_VAE.load_state_dict(state_dict["net_state_dict"])
+        speech_VAE.to(device)
+        # The input length must be a multiple of 4
+        T = spec_FTM.shape[1]
+        spec_FTM = spec_FTM[:, : T // 4 * 4]
+    else:
+        speech_VAE = None
+
     separater = ARMA_JD(
         n_speech=args.n_speech,
         n_noise=args.n_noise,
-        speech_model=["NMF", "FreqInv", "DNN"][0],
-        noise_model=["TimeInv", "NMF"][0],
+        speech_model=args.speech_model,
+        noise_model=args.noise_model,
         n_basis=args.n_basis,
+        speech_VAE=speech_VAE,
         mode=["IP", "ISS1", "ISS2"][0],
-        speech_VAE=None,
         n_tap_direct=0,
         g_eps=1e-2,
         lr=1e-3,
@@ -646,7 +660,7 @@ if __name__ == "__main__":
         n_iter=args.n_iter,
         save_likelihood=False,
         save_param=False,
-        save_wav=False,
+        save_wav=True,
         save_dir="./",
         interval_save=100,
     )
