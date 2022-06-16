@@ -40,6 +40,8 @@ class ARMA_JD(Base):
         mode=["IP", "ISS1", "ISS2"][0],
         init_SCM="circular",
         speech_VAE=None,
+        n_iter_init=30,
+        n_iter_z=10,
         n_tap_AR=3,
         n_tap_MA=2,
         n_delay_AR=3,
@@ -83,6 +85,8 @@ class ARMA_JD(Base):
         self.n_tap_AR = n_tap_AR  # Lr
         self.n_delay_AR = n_delay_AR  # Delta_r
         self.n_tap_direct = n_tap_direct
+        self.n_iter_init = n_iter_init
+        self.n_iter_z = n_iter_z
         self.g_eps = g_eps
         self.lr = lr
 
@@ -92,7 +96,16 @@ class ARMA_JD(Base):
             self.n_delay_AR = 0
 
         self.speech_VAE = speech_VAE
-        # assert self.speech_model == "DNN" and self.speech_VAE is not None
+
+        if self.speech_model == "NMF":
+            self.save_param_list += ["W_NsFK", "H_NsKT"]
+        elif self.speech_model == "FreqInv":
+            self.save_param_list += ["lambda_NsT"]
+        elif self.speech_model == "DNN":
+            self.save_param_list += ["U_NsF", "V_NsT", "Z_NsDT"]
+
+        if self.n_noise > 0:
+            self.save_param_list += ["W_noise_NnFK", "H_noise_NnKT"]
 
         self.method_name = "ARMA_JD"
 
@@ -192,7 +205,16 @@ class ARMA_JD(Base):
                 self.G_NLdM[m % self.n_src, 0, m] = 1
 
         elif "twostep" in self.init_SCM:
-            self.start_idx = 50
+            if self.n_iter_init >= self.n_iter:
+                print(
+                    "\n------------------------------------------------------------------\n"
+                    f"Warning: n_iter_init must be smaller than n_iter (= {self.n_iter}).\n"
+                    f"n_iter_init is changed from {self.n_iter_init} to {self.n_iter // 3}"
+                    "\n------------------------------------------------------------------\n"
+                )
+                self.n_iter_init = self.n_iter // 3
+
+            self.start_idx = self.n_iter_init
 
             separater_init = ARMA_JD(
                 n_speech=self.n_speech,
@@ -355,6 +377,30 @@ class ARMA_JD(Base):
         self.calculate_Y()
 
     def update_PSD_DNN(self):
+        if self.n_noise > 0:
+            Y_noise_FTM_torch = (
+                self.lambda_NFT[self.n_speech :, :, :, None] * self.G_NLdM[self.n_speech :, 0, None, None]
+            ).sum(axis=0)
+            for l in range(1, 1 + self.n_tap_MA):
+                Y_noise_FTM_torch[:, l:] += (
+                    self.lambda_NFT[self.n_speech :, :, :-l, None] * self.G_NLdM[self.n_speech :, l, None, None]
+                ).sum(axis=0)
+        else:
+            Y_noise_FTM_torch = self.xp.zeros_like(self.X_FTM, dtype=self.TYPE_FLOAT)
+        Y_noise_FTM_torch = torch.as_tensor(Y_noise_FTM_torch, device=self.torch_device)
+        G_NLdM_torch = torch.as_tensor(self.G_NLdM, device=self.torch_device)
+        UV_NsFT_torch = torch.as_tensor(self.U_NsF[:, :, None] * self.V_NsT[:, None], device=self.torch_device)
+
+        for it in range(self.n_iter_z):
+            self.z_optimizer.zero_grad()
+            loss = self.loss_fn(Y_noise_FTM_torch, G_NLdM_torch, UV_NsFT_torch)
+            loss.backward()
+            self.z_optimizer.step()
+
+        with torch.set_grad_enabled(False):
+            self.power_speech_NsxFxT = self.xp.asarray(self.speech_VAE.decode_(self.Z_NsDT))
+        self.calculate_Y()
+
         XY2_FTM = self.Px_power_FTM / (self.Y_FTM**2)
         VZG_NsFTLM = (self.V_NsT[:, :, None, None] * self.G_NLdM[: self.n_speech, None])[
             :, None
@@ -408,32 +454,7 @@ class ARMA_JD(Base):
             torch.log(Y_tmp_FTM) + torch.as_tensor(self.Px_power_FTM, device=self.torch_device) / Y_tmp_FTM
         ).sum() / (self.n_freq * self.n_mic)
 
-    def update_Z(self):
-        if self.n_noise > 0:
-            Y_noise_FTM_torch = (
-                self.lambda_NFT[self.n_speech :, :, :, None] * self.G_NLdM[self.n_speech :, 0, None, None]
-            ).sum(axis=0)
-            for l in range(1, 1 + self.n_tap_MA):
-                Y_noise_FTM_torch[:, l:] += (
-                    self.lambda_NFT[self.n_speech :, :, :-l, None] * self.G_NLdM[self.n_speech :, l, None, None]
-                ).sum(axis=0)
-        else:
-            Y_noise_FTM_torch = self.xp.zeros_like(self.X_FTM, dtype=self.TYPE_FLOAT)
-        Y_noise_FTM_torch = torch.as_tensor(Y_noise_FTM_torch, device=self.torch_device)
-        G_NLdM_torch = torch.as_tensor(self.G_NLdM, device=self.torch_device)
-        UV_NsFT_torch = torch.as_tensor(self.U_NsF[:, :, None] * self.V_NsT[:, None], device=self.torch_device)
 
-        for it in range(self.n_Z_iteration):
-            self.z_optimizer.zero_grad()
-            loss = self.loss_fn(Y_noise_FTM_torch, G_NLdM_torch, UV_NsFT_torch)
-            loss.backward()
-            self.z_optimizer.step()
-
-        with torch.set_grad_enabled(False):
-            self.power_speech_NsxFxT = self.xp.asarray(self.speech_VAE.decode_(self.Z_NsDT))
-
-    # @check_likelihood
-    # @check_nan
     def update_G(self):
         XY2_FTM = self.Px_power_FTM / (self.Y_FTM**2)
         a_G_NM = ((self.lambda_NFT)[..., None] * XY2_FTM[None]).sum(axis=(1, 2))
@@ -445,7 +466,6 @@ class ARMA_JD(Base):
             self.G_NLdM[:, l] *= self.xp.sqrt(a_G_NM / b_G_NM)
         self.calculate_Y()
 
-    # @check_likelihood
     def update_AR(self):
         if self.mode == "IP":
             for m in range(self.n_mic):
@@ -505,7 +525,6 @@ class ARMA_JD(Base):
         self.Q_FMM = self.P_FxMxMLt[:, :, : self.n_mic]
         self.calculate_Px_power()
 
-    # @check_likelihood
     def normalize(self):
         if self.speech_model in ["NMF", "DNN"]:
             phi_F = self.xp.sum(self.Q_FMM * self.Q_FMM.conj(), axis=(1, 2)).real / self.n_mic
@@ -547,13 +566,6 @@ class ARMA_JD(Base):
 
     def separate(self, mic_index=MIC_INDEX):
         self.calculate_Yn()
-        self._separate(mic_index=mic_index)
-
-    def separate_direct(self, mic_index=MIC_INDEX):
-        self.calculate_Yn_direct()
-        self._separate(mic_index=mic_index)
-
-    def _separate(self, mic_index=MIC_INDEX):
         self.calculate_Y()
         self.calculate_Px()
         Q_inv_FMM = self.xp.linalg.inv(self.Q_FMM)
@@ -565,20 +577,26 @@ class ARMA_JD(Base):
             self.separated_spec[n] = self.convert_to_NumpyArray(tmp)
         return self.separated_spec
 
-    def save_param(self, filename="test.pic"):
-        param_list = [self.W_NsFK, self.H_NsKT, self.G_NLdM, self.P_FxMxMLt]
-        if self.xp != np:
-            param_list = [self.convert_to_NumpyArray(param) for param in param_list]
-        pic.dump(param_list, open(filename, "wb"))
-
     def load_param(self, filename):
-        param_list = pic.load(open(filename, "rb"))
-        if self.xp != np:
-            param_list = [self.xp.asarray(param) for param in param_list]
-        self.W_NsFK, self.H_NsKT, self.G_NLdM, self.P_FxMxMLt = param_list
+        super().load_param(filename)
 
-        self.n_speech, self.n_freq, self.n_basis = self.W_NsFK.shape
-        self.n_time = self.H_NsKT[2]
+        if hasattr(self, "W_NsFK"):
+            self.speech_model = "NMF"
+            self.n_speech, _, self.n_basis = self.W_NFK.shape
+        elif hasattr(self, "lambda_NsT"):
+            self.speech_model = "FreqInv"
+            self.n_speech = self.lambda_NsT.shape[0]
+        elif hasattr(self, "U_NsF"):
+            self.speech_model = "DNN"
+            self.n_speech = self.U_NsF.shape[0]
+        
+        if hasattr(self, "W_noise_NnFK"):
+            self.n_basis = self.W_noise_NnFK.shape[-1]
+            if self.n_basis == 1:
+                self.noise_model = "TimeInv"
+            else:
+                self.noise_model = "NMF"
+
         self.n_tap_MA = self.G_NLdM[1] - 1
         self.n_tap_AR = (self.P_FxMxMLt.shape[2] / self.n_mic) - 1
 
@@ -603,6 +621,8 @@ if __name__ == "__main__":
     parser.add_argument("--n_delay_AR", type=int, default=3, help="delay parameter for AR model")
     parser.add_argument("--init_SCM", type=str, default="twostep", help="circular or twostep")
     parser.add_argument("--n_iter", type=int, default=100, help="number of iteration")
+    parser.add_argument("--n_iter_init", type=int, default=100, help="number of iteration for initialization")
+    parser.add_argument("--n_iter_z", type=int, default=100, help="number of iteration for updating Z")
     parser.add_argument("--n_mic", type=int, default=8, help="number of microphone")
     parser.add_argument("--n_bit", type=int, default=64, help="number of microphone")
     args = parser.parse_args()
@@ -647,6 +667,8 @@ if __name__ == "__main__":
         g_eps=1e-2,
         lr=1e-3,
         xp=xp,
+        n_iter_init=args.n_iter_init,
+        n_iter_z=args.n_iter_z,
         init_SCM=args.init_SCM,
         n_tap_MA=args.n_tap_MA,
         n_tap_AR=args.n_tap_AR,
@@ -655,7 +677,6 @@ if __name__ == "__main__":
     )
     separater.file_id = args.file_id
     separater.load_spectrogram(spec_FTM, sample_rate)
-    separater.n_iter = args.n_iter
     separater.solve(
         n_iter=args.n_iter,
         save_likelihood=False,
