@@ -131,16 +131,21 @@ class Base:
         """
         Parameters:
             n_iter: int
+                The number of iterations for updating parameters
             save_dir: str
+                The directory used for saving the wav, param, or log-likelihood
             save_wav: bool
-                Save the separated signals only after the last iteration 
+                Save the separated signals only after the last iteration
             save_wav_all: bool
                 Save the separated signals at every 'interval_save' iterations
             save_param: bool
+                Save the estimated parameters only after the last iteration
             save_param_all: bool
+                Save the estimated parameters at every 'interval_save' iterations
             save_likelihood: bool
+                Save the log-likelihoods calculated at every 'interval_save' iterations after the last iteration
             interval_save: int
-                interval of saving wav, parameter, and log-likelihood
+                Interval of saving wav, parameter, and log-likelihood.
         """
         self.n_iter = n_iter
         if init:
@@ -167,11 +172,11 @@ class Base:
 
         self.separate(mic_index=mic_index)
         if save_wav or save_wav_all:
-            save_fname = f"{save_dir}/{self.method_name}-sep-{str(self)}-{n_iter}.wav"
+            save_fname = f"{save_dir}/{self.method_name}-sep-{str(self)}.wav"
             self.save_to_wav(self.separated_spec, save_fname=save_fname, shape="FTM")
 
         if save_param or save_param_all:
-            save_fname = f"{save_dir}/{self.method_name}-param-{str(self)}-{n_iter}.h5"
+            save_fname = f"{save_dir}/{self.method_name}-param-{str(self)}.h5"
             self.save_param(save_fname)
 
         if save_likelihood:
