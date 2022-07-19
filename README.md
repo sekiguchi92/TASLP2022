@@ -1,4 +1,4 @@
-# TASLP2019
+# TASLP2022
 The code for joint source separation and dereverberation method called ARMA-FastMNMF which will be published in TASLP2022.
 
 
